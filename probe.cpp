@@ -29,9 +29,6 @@ constexpr int maxFftSize = maxAdaptiveFftSize * fftMultipliers.back();
 constexpr int decodeBlockFrames = 4096;
 constexpr int baseStripHeight = 35;
 constexpr int maxHeightMultiplier = 4;
-constexpr DWORD backgroundGray = 40; // Skin.Common.Color.Background.Dark in Charm
-constexpr DWORD unplayedPeak = 0xd8d8d8;
-constexpr DWORD playedPeak = 0xde8c33;
 constexpr double minimumDisplayDb = -68;
 constexpr double maximumDisplayDb = -15;
 constexpr int paletteLevels = 512;
@@ -43,6 +40,8 @@ IAIMPServiceAudioDecoders* decoders;
 IAIMPServiceFileInfo* fileInfo;
 IAIMPServiceConfig* config;
 IAIMPServiceOptionsDialog* optionsDialog;
+IAIMPUIMode* uiMode;
+std::wstring skinSettingsPath;
 
 enum class WindowFunction : UINT16 { BlackmanHarris, Hann, Triangular, Hamming, Blackman, Welch };
 constexpr std::array windowNames{L"Blackman–Harris", L"Hann", L"Triangular", L"Hamming",
@@ -211,26 +210,30 @@ struct SpectralWindow {
     }
 };
 
-constexpr DWORD shade(DWORD peak, double strength) {
-    const auto channel = [strength](DWORD maximum) {
-        return backgroundGray + static_cast<DWORD>(
-            strength * (maximum - backgroundGray) + .5);
-    };
-    const DWORD red = channel((peak >> 16) & 0xff);
-    const DWORD green = channel((peak >> 8) & 0xff);
-    const DWORD blue = channel(peak & 0xff);
-    return (red << 16) | (green << 8) | blue;
-}
-
-constexpr auto makePalette(DWORD peak) {
+constexpr auto makePalette(int background, DWORD peak) {
     std::array<DWORD, paletteLevels> palette{};
-    for (int i = 0; i < paletteLevels; ++i)
-        palette[i] = shade(peak, static_cast<double>(i) / (paletteLevels - 1));
+    for (int i = 0; i < paletteLevels; ++i) {
+        const double strength = static_cast<double>(i) / (paletteLevels - 1);
+        const auto channel = [=](int maximum) {
+            return static_cast<DWORD>(background + strength * (maximum - background) + .5);
+        };
+        palette[i] = (channel((peak >> 16) & 0xff) << 16) |
+            (channel((peak >> 8) & 0xff) << 8) | channel(peak & 0xff);
+    }
     return palette;
 }
 
-constexpr auto playedPalette = makePalette(playedPeak);
-constexpr auto unplayedPalette = makePalette(unplayedPeak);
+struct SpectrumColors {
+    int background;
+    std::array<DWORD, paletteLevels> unplayed;
+    std::array<DWORD, paletteLevels> played;
+    int cursorBrush;
+};
+
+constexpr SpectrumColors darkColors{40, makePalette(40, 0xd8d8d8),
+    makePalette(40, 0xde8c33), WHITE_BRUSH};
+constexpr SpectrumColors lightColors{255, makePalette(255, 0x484848),
+    makePalette(255, 0xb45b12), BLACK_BRUSH};
 
 bool cueRange(IAIMPString* uri, double duration, int rate, INT64 streamFrames,
               INT64& firstFrame, INT64& frameCount) {
@@ -279,6 +282,10 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
     std::vector<DWORD> unplayedPixels;
     std::vector<DWORD> playedPixels;
     SpectralWindow spectralWindow;
+    const SpectrumColors* colors = &darkColors;
+    std::chrono::steady_clock::time_point nextThemeRead{};
+    static constexpr UINT unknownAppearance = static_cast<UINT>(-1);
+    UINT skinAppearance = unknownAppearance;
     SpectrumSettings analysisSettings = defaultSettings;
 
     void discardTrack() {
@@ -324,7 +331,7 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
             bandEndBins[band] = static_cast<int>(std::ceil(edge));
         }
         bandEndBins.back() = binCount + 1;
-        constexpr DWORD backgroundPixel = backgroundGray * 0x010101;
+        const DWORD backgroundPixel = colors->unplayed.front();
         unplayedPixels.assign(static_cast<size_t>(plotHeight) * columns, backgroundPixel);
         playedPixels.assign(unplayedPixels.size(), backgroundPixel);
         const double framesPerColumn = static_cast<double>(frames) / columns;
@@ -403,8 +410,8 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
             const int colorIndex = static_cast<int>(std::clamp(level, 0.0, 1.0) * (paletteLevels - 1));
             const int y = plotHeight - 1 - band;
             const size_t pixel = static_cast<size_t>(y) * columns + nextColumn;
-            std::fill_n(unplayedPixels.begin() + pixel, span, unplayedPalette[colorIndex]);
-            std::fill_n(playedPixels.begin() + pixel, span, playedPalette[colorIndex]);
+            std::fill_n(unplayedPixels.begin() + pixel, span, colors->unplayed[colorIndex]);
+            std::fill_n(playedPixels.begin() + pixel, span, colors->played[colorIndex]);
         }
 
         // Each shorter pass fills the gaps between positions calculated on previous passes.
@@ -489,10 +496,22 @@ public:
     }
     void WINAPI Draw(HCANVAS canvas, PAIMPVisualData) override {
         if (width <= 0 || height <= 0 || switchingLayout.load()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextThemeRead && !skinSettingsPath.empty()) {
+            skinAppearance = GetPrivateProfileIntW(L"ThemeAppearanceSwitcher", L"Position",
+                -1, skinSettingsPath.c_str());
+            nextThemeRead = now + std::chrono::seconds(1);
+        }
+        INT32 style = AIMPUI_STYLE_DARK;
+        if (uiMode) uiMode->GetValueAsInt32(AIMPUI_MODE_PROPID_STYLE, &style);
+        // Charm encodes the dark flag in the lowest bit of its appearance counter.
+        const bool light = skinAppearance != unknownAppearance ? (skinAppearance & 1) == 0 : style == AIMPUI_STYLE_LIGHT;
+        const auto* newColors = light ? &lightColors : &darkColors;
         const auto selected = settings.load();
         const int newPlotHeight = std::clamp(MulDiv(baseStripHeight * selected.height,
             GetDeviceCaps(canvas, LOGPIXELSY), 96), 1, height);
-        if (!selected.sameAnalysis(analysisSettings) || plotHeight != newPlotHeight) {
+        if (!selected.sameAnalysis(analysisSettings) || plotHeight != newPlotHeight || colors != newColors) {
+            colors = newColors;
             analysisSettings = selected;
             plotHeight = newPlotHeight;
             discardTrack();
@@ -501,7 +520,7 @@ public:
         analyzeNextBlock();
         RECT area = {0, 0, width, height};
         const COLORREF previousBrushColor = SetDCBrushColor(canvas,
-            RGB(backgroundGray, backgroundGray, backgroundGray));
+            RGB(colors->background, colors->background, colors->background));
         FillRect(canvas, &area, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
         SetDCBrushColor(canvas, previousBrushColor);
         if (!hasImage || initialPass) return;
@@ -534,7 +553,7 @@ public:
             }
         }
         RECT line = {x, plotTop, x + 1, plotTop + plotHeight};
-        FillRect(canvas, &line, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+        FillRect(canvas, &line, static_cast<HBRUSH>(GetStockObject(colors->cursorBrush)));
     }
 };
 
@@ -781,6 +800,8 @@ OptionsFrame optionsFrame;
 class Plugin final : public IAIMPPlugin, public IAIMPExternalSettingsDialog {
     LONG references = 1;
     void releaseServices() {
+        if (uiMode) std::exchange(uiMode, nullptr)->Release();
+        skinSettingsPath.clear();
         if (optionsDialog) std::exchange(optionsDialog, nullptr)->Release();
         if (config) std::exchange(config, nullptr)->Release();
         if (fileInfo) std::exchange(fileInfo, nullptr)->Release();
@@ -824,6 +845,19 @@ public:
             return result;
         }
         host->QueryInterface(IID_IAIMPServiceConfig, reinterpret_cast<void**>(&config));
+        IAIMPServiceUI* rawUI = nullptr;
+        if (SUCCEEDED(host->QueryInterface(IID_IAIMPServiceUI, reinterpret_cast<void**>(&rawUI))) && rawUI) {
+            AimpPtr<IAIMPServiceUI> ui(rawUI);
+            ui->QueryInterface(IID_IAIMPUIMode, reinterpret_cast<void**>(&uiMode));
+        }
+        IAIMPString* rawSkinPath = nullptr;
+        if (SUCCEEDED(host->GetPath(AIMP_CORE_PATH_SKINS, &rawSkinPath)) && rawSkinPath) {
+            AimpPtr<IAIMPString> skinPath(rawSkinPath);
+            skinSettingsPath.assign(skinPath->GetData(), skinPath->GetLength());
+            if (!skinSettingsPath.empty() && skinSettingsPath.back() != L'\\')
+                skinSettingsPath += L'\\';
+            skinSettingsPath += L"SpectrogramProbe.ini";
+        }
         settings.store(loadSettings());
         result = host->RegisterExtension(IID_IAIMPServiceVisualizations, &visualizer);
         if (SUCCEEDED(result)) {
