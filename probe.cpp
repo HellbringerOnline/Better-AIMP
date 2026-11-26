@@ -41,6 +41,7 @@ IAIMPServiceFileInfo* fileInfo;
 IAIMPServiceConfig* config;
 IAIMPServiceOptionsDialog* optionsDialog;
 IAIMPUIMode* uiMode;
+IAIMPUIColorSchema* uiColorSchema;
 std::wstring skinSettingsPath;
 
 enum class WindowFunction : UINT16 { BlackmanHarris, Hann, Triangular, Hamming, Blackman, Welch };
@@ -210,30 +211,73 @@ struct SpectralWindow {
     }
 };
 
-constexpr auto makePalette(int background, DWORD peak) {
+constexpr auto makePalette(DWORD background, DWORD peak) {
     std::array<DWORD, paletteLevels> palette{};
     for (int i = 0; i < paletteLevels; ++i) {
         const double strength = static_cast<double>(i) / (paletteLevels - 1);
-        const auto channel = [=](int maximum) {
-            return static_cast<DWORD>(background + strength * (maximum - background) + .5);
+        const auto channel = [=](int shift) {
+            const int start = (background >> shift) & 0xff;
+            const int end = (peak >> shift) & 0xff;
+            return static_cast<DWORD>(start + strength * (end - start) + .5) << shift;
         };
-        palette[i] = (channel((peak >> 16) & 0xff) << 16) |
-            (channel((peak >> 8) & 0xff) << 8) | channel(peak & 0xff);
+        palette[i] = channel(16) | channel(8) | channel(0);
     }
     return palette;
 }
 
 struct SpectrumColors {
-    int background;
+    DWORD background;
     std::array<DWORD, paletteLevels> unplayed;
     std::array<DWORD, paletteLevels> played;
     int cursorBrush;
 };
 
-constexpr SpectrumColors darkColors{40, makePalette(40, 0xd8d8d8),
-    makePalette(40, 0xde8c33), WHITE_BRUSH};
-constexpr SpectrumColors lightColors{255, makePalette(255, 0x484848),
-    makePalette(255, 0xb45b12), BLACK_BRUSH};
+constexpr SpectrumColors darkColors{0x282828, makePalette(0x282828, 0xd8d8d8),
+    makePalette(0x282828, 0xde8c33), WHITE_BRUSH};
+constexpr SpectrumColors lightColors{0xffffff, makePalette(0xffffff, 0x484848),
+    makePalette(0xffffff, 0xb45b12), BLACK_BRUSH};
+
+DWORD samplePlayerBackground() {
+    HWND mainWindow = nullptr;
+    EnumWindows([](HWND window, LPARAM output) -> BOOL {
+        DWORD process = 0;
+        GetWindowThreadProcessId(window, &process);
+        wchar_t className[32]{};
+        if (process != GetCurrentProcessId() || !IsWindowVisible(window) || IsIconic(window) ||
+            !GetClassNameW(window, className, static_cast<int>(std::size(className))) ||
+            std::wcscmp(className, L"TAIMPMainForm") != 0) return TRUE;
+        *reinterpret_cast<HWND*>(output) = window;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&mainWindow));
+    if (!mainWindow) return CLR_INVALID;
+    RECT bounds{};
+    if (!GetWindowRect(mainWindow, &bounds)) return CLR_INVALID;
+    const int width = bounds.right - bounds.left;
+    const int y = MulDiv(25, GetDpiForWindow(mainWindow), 96);
+    if (width < 120 || y <= 0 || bounds.bottom - bounds.top <= y) return CLR_INVALID;
+
+    const HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return CLR_INVALID;
+    const HBITMAP bitmap = CreateBitmap(width, y + 1, 1, 32, nullptr);
+    DWORD result = CLR_INVALID;
+    if (bitmap) {
+        const HGDIOBJ previous = SelectObject(dc, bitmap);
+        if (previous && PrintWindow(mainWindow, dc, PW_RENDERFULLCONTENT)) {
+            const COLORREF first = GetPixel(dc, width / 4, y);
+            const COLORREF middle = GetPixel(dc, width / 2, y);
+            const COLORREF last = GetPixel(dc, 3 * width / 4, y);
+            const COLORREF sample = first == middle || first == last ? first :
+                middle == last ? middle : CLR_INVALID;
+            // A failed or blank layered-window capture can return black.
+            if (sample != CLR_INVALID && sample != 0)
+                result = RGB(GetBValue(sample), GetGValue(sample), GetRValue(sample));
+        }
+        if (previous) SelectObject(dc, previous);
+        DeleteObject(bitmap);
+    }
+    DeleteDC(dc);
+    return result;
+}
 
 bool cueRange(IAIMPString* uri, double duration, int rate, INT64 streamFrames,
               INT64& firstFrame, INT64& frameCount) {
@@ -282,10 +326,14 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
     std::vector<DWORD> unplayedPixels;
     std::vector<DWORD> playedPixels;
     SpectralWindow spectralWindow;
-    const SpectrumColors* colors = &darkColors;
+    SpectrumColors colors = darkColors;
+    std::vector<UINT16> pixelLevels;
+    bool samplingTheme = false;
     std::chrono::steady_clock::time_point nextThemeRead{};
     static constexpr UINT unknownAppearance = static_cast<UINT>(-1);
     UINT skinAppearance = unknownAppearance;
+    DWORD capturedBackground = CLR_INVALID;
+    DWORD playedColor = 0xde8c33;
     SpectrumSettings analysisSettings = defaultSettings;
 
     void discardTrack() {
@@ -331,9 +379,10 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
             bandEndBins[band] = static_cast<int>(std::ceil(edge));
         }
         bandEndBins.back() = binCount + 1;
-        const DWORD backgroundPixel = colors->unplayed.front();
+        const DWORD backgroundPixel = colors.unplayed.front();
         unplayedPixels.assign(static_cast<size_t>(plotHeight) * columns, backgroundPixel);
         playedPixels.assign(unplayedPixels.size(), backgroundPixel);
+        pixelLevels.assign(unplayedPixels.size(), 0);
         const double framesPerColumn = static_cast<double>(frames) / columns;
         initialPass = true;
         columnStep = 16 * framesPerColumn / rate < 14 ? 8 : 16;
@@ -410,8 +459,9 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
             const int colorIndex = static_cast<int>(std::clamp(level, 0.0, 1.0) * (paletteLevels - 1));
             const int y = plotHeight - 1 - band;
             const size_t pixel = static_cast<size_t>(y) * columns + nextColumn;
-            std::fill_n(unplayedPixels.begin() + pixel, span, colors->unplayed[colorIndex]);
-            std::fill_n(playedPixels.begin() + pixel, span, colors->played[colorIndex]);
+            std::fill_n(pixelLevels.begin() + pixel, span, colorIndex);
+            std::fill_n(unplayedPixels.begin() + pixel, span, colors.unplayed[colorIndex]);
+            std::fill_n(playedPixels.begin() + pixel, span, colors.played[colorIndex]);
         }
 
         // Each shorter pass fills the gaps between positions calculated on previous passes.
@@ -496,22 +546,45 @@ public:
     }
     void WINAPI Draw(HCANVAS canvas, PAIMPVisualData) override {
         if (width <= 0 || height <= 0 || switchingLayout.load()) return;
+        if (samplingTheme) return;
         const auto now = std::chrono::steady_clock::now();
-        if (now >= nextThemeRead && !skinSettingsPath.empty()) {
-            skinAppearance = GetPrivateProfileIntW(L"ThemeAppearanceSwitcher", L"Position",
-                -1, skinSettingsPath.c_str());
+        if (now >= nextThemeRead) {
             nextThemeRead = now + std::chrono::seconds(1);
+            if (!skinSettingsPath.empty()) {
+                skinAppearance = GetPrivateProfileIntW(L"ThemeAppearanceSwitcher", L"Position",
+                    -1, skinSettingsPath.c_str());
+            }
+            samplingTheme = true;
+            const DWORD sample = samplePlayerBackground();
+            samplingTheme = false;
+            if (sample != CLR_INVALID) capturedBackground = sample;
+
+            INT32 style = AIMPUI_STYLE_DARK;
+            if (uiMode) uiMode->GetValueAsInt32(AIMPUI_MODE_PROPID_STYLE, &style);
+            const bool savedLight = skinAppearance != unknownAppearance ?
+                (skinAppearance & 1) == 0 : style == AIMPUI_STYLE_LIGHT;
+            const auto& fallback = savedLight ? lightColors : darkColors;
+            const DWORD background = capturedBackground == CLR_INVALID ? fallback.background : capturedBackground;
+            const int luma = 299 * ((background >> 16) & 255) +
+                587 * ((background >> 8) & 255) + 114 * (background & 255);
+            const bool light = luma >= 128000;
+            DWORD accent = light ? 0xffb45b12 : 0xffde8c33;
+            if (uiColorSchema) uiColorSchema->ApplyToARGB(&accent);
+            accent &= 0xffffff;
+            if (background != colors.background || accent != playedColor) {
+                playedColor = accent;
+                colors = {background, makePalette(background, light ? 0x484848 : 0xd8d8d8),
+                    makePalette(background, accent), light ? BLACK_BRUSH : WHITE_BRUSH};
+                for (size_t i = 0; i < pixelLevels.size(); ++i) {
+                    unplayedPixels[i] = colors.unplayed[pixelLevels[i]];
+                    playedPixels[i] = colors.played[pixelLevels[i]];
+                }
+            }
         }
-        INT32 style = AIMPUI_STYLE_DARK;
-        if (uiMode) uiMode->GetValueAsInt32(AIMPUI_MODE_PROPID_STYLE, &style);
-        // Charm encodes the dark flag in the lowest bit of its appearance counter.
-        const bool light = skinAppearance != unknownAppearance ? (skinAppearance & 1) == 0 : style == AIMPUI_STYLE_LIGHT;
-        const auto* newColors = light ? &lightColors : &darkColors;
         const auto selected = settings.load();
         const int newPlotHeight = std::clamp(MulDiv(baseStripHeight * selected.height,
             GetDeviceCaps(canvas, LOGPIXELSY), 96), 1, height);
-        if (!selected.sameAnalysis(analysisSettings) || plotHeight != newPlotHeight || colors != newColors) {
-            colors = newColors;
+        if (!selected.sameAnalysis(analysisSettings) || plotHeight != newPlotHeight) {
             analysisSettings = selected;
             plotHeight = newPlotHeight;
             discardTrack();
@@ -520,7 +593,7 @@ public:
         analyzeNextBlock();
         RECT area = {0, 0, width, height};
         const COLORREF previousBrushColor = SetDCBrushColor(canvas,
-            RGB(colors->background, colors->background, colors->background));
+            RGB((colors.background >> 16) & 255, (colors.background >> 8) & 255, colors.background & 255));
         FillRect(canvas, &area, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
         SetDCBrushColor(canvas, previousBrushColor);
         if (!hasImage || initialPass) return;
@@ -553,7 +626,7 @@ public:
             }
         }
         RECT line = {x, plotTop, x + 1, plotTop + plotHeight};
-        FillRect(canvas, &line, static_cast<HBRUSH>(GetStockObject(colors->cursorBrush)));
+        FillRect(canvas, &line, static_cast<HBRUSH>(GetStockObject(colors.cursorBrush)));
     }
 };
 
@@ -800,6 +873,7 @@ OptionsFrame optionsFrame;
 class Plugin final : public IAIMPPlugin, public IAIMPExternalSettingsDialog {
     LONG references = 1;
     void releaseServices() {
+        if (uiColorSchema) std::exchange(uiColorSchema, nullptr)->Release();
         if (uiMode) std::exchange(uiMode, nullptr)->Release();
         skinSettingsPath.clear();
         if (optionsDialog) std::exchange(optionsDialog, nullptr)->Release();
@@ -849,6 +923,7 @@ public:
         if (SUCCEEDED(host->QueryInterface(IID_IAIMPServiceUI, reinterpret_cast<void**>(&rawUI))) && rawUI) {
             AimpPtr<IAIMPServiceUI> ui(rawUI);
             ui->QueryInterface(IID_IAIMPUIMode, reinterpret_cast<void**>(&uiMode));
+            ui->QueryInterface(IID_IAIMPUIColorSchema, reinterpret_cast<void**>(&uiColorSchema));
         }
         IAIMPString* rawSkinPath = nullptr;
         if (SUCCEEDED(host->GetPath(AIMP_CORE_PATH_SKINS, &rawSkinPath)) && rawSkinPath) {
