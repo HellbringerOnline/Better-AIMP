@@ -1,0 +1,8 @@
+*.heaptimeline
+Trace-*.json.gz
+*.har
+*.log
+__pycache__/
+/dist/
+*.pdb
+*.lib
