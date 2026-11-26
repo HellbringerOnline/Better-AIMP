@@ -1,6 +1,6 @@
 # Better AIMP
 
-<img width="1038" height="785" alt="image" src="https://github.com/user-attachments/assets/60dda329-cdb7-40b3-a7f5-4a270a6f7a7c" />
+<img width="1178" height="908" alt="image" src="https://github.com/user-attachments/assets/6604b94c-e591-4329-9ae9-9bf797d68ad0" />
 
 
 Неофициальный плагин для **AIMP 6 x64**. Показывает спектрограмму текущего локального трека вместо волновой формы. 
