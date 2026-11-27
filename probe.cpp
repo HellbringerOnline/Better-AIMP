@@ -279,31 +279,53 @@ DWORD samplePlayerBackground() {
     return result;
 }
 
-bool cueRange(IAIMPString* uri, double duration, int rate, INT64 streamFrames,
-              INT64& firstFrame, INT64& frameCount) {
-    IAIMPVirtualFile* track = nullptr;
-    if (FAILED(fileInfo->GetVirtualFile(uri, 0, &track)) || !track) return false;
+enum class TrackRangeStatus { Ready, AwaitingMetadata, Invalid };
+
+struct TrackRange {
+    double start = 0;
+    double end = 0;
+};
+
+TrackRangeStatus readTrackRange(IAIMPString* uri, IAIMPPlaylistItem* item, TrackRange& range) {
+    IAIMPVirtualFile* rawTrack = nullptr;
+    const HRESULT result = fileInfo->GetVirtualFile(uri, 0, &rawTrack);
+    AimpPtr<IAIMPVirtualFile> track(rawTrack);
+    if (result != S_OK || !track) return TrackRangeStatus::Ready;
+
     double start = 0, end = 0;
     const HRESULT hasStart = track->GetValueAsFloat(AIMP_VIRTUALFILE_PROPID_CLIPSTART, &start);
     const HRESULT hasEnd = track->GetValueAsFloat(AIMP_VIRTUALFILE_PROPID_CLIPFINISH, &end);
-    track->Release();
-    if (FAILED(hasStart) || !std::isfinite(start) || start < 0 ||
-        start >= static_cast<double>(streamFrames) / rate) return false;
-    if (FAILED(hasEnd) || end <= 0) end = start + duration;
-    if (!std::isfinite(end) || end <= start || std::abs(end - start - duration) > 1) return false;
-    const INT64 endFrame = std::llround(end * rate);
-    firstFrame = std::llround(start * rate);
-    frameCount = (endFrame < streamFrames ? endFrame : streamFrames) - firstFrame;
-    return frameCount > 0 && std::abs(static_cast<double>(frameCount) / rate - duration) <= 1;
+    if (hasStart == E_NOTIMPL && hasEnd == E_NOTIMPL) return TrackRangeStatus::Ready;
+    if (FAILED(hasStart)) return TrackRangeStatus::AwaitingMetadata;
+    if (!std::isfinite(start) || start < 0) return TrackRangeStatus::Invalid;
+    if (FAILED(hasEnd) || end <= 0) {
+        IAIMPFileInfo* rawInfo = nullptr;
+        const HRESULT infoResult = item->GetValueAsObject(AIMP_PLAYLISTITEM_PROPID_FILEINFO,
+            IID_IAIMPFileInfo, reinterpret_cast<void**>(&rawInfo));
+        AimpPtr<IAIMPFileInfo> info(rawInfo);
+        double duration = 0;
+        if (FAILED(infoResult) || !info ||
+            FAILED(info->GetValueAsFloat(AIMP_FILEINFO_PROPID_DURATION, &duration)) ||
+            !std::isfinite(duration) || duration <= 0) return TrackRangeStatus::AwaitingMetadata;
+        end = start + duration;
+    }
+    if (!std::isfinite(end) || end <= start) return TrackRangeStatus::Invalid;
+    range = {start, end};
+    return TrackRangeStatus::Ready;
 }
 
 class Visualization final : public IAIMPExtensionEmbeddedVisualization {
+    using Clock = std::chrono::steady_clock;
+    static constexpr int metadataAttemptLimit = 6;
+    static constexpr auto metadataRetryInterval = std::chrono::milliseconds(500);
     LONG references = 1;
     int width = 0;
     int height = 0;
     int plotHeight = 0;
     bool hasImage = false;
     AimpPtr<IAIMPPlaylistItem> activeTrack;
+    Clock::time_point nextMetadataAttempt{};
+    int metadataAttemptsLeft = 0;
     AimpPtr<IAIMPAudioDecoder> decoder;
     INT64 frames = 0;
     INT32 channels = 0;
@@ -329,7 +351,7 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
     SpectrumColors colors = darkColors;
     std::vector<UINT16> pixelLevels;
     bool samplingTheme = false;
-    std::chrono::steady_clock::time_point nextThemeRead{};
+    Clock::time_point nextThemeRead{};
     static constexpr UINT unknownAppearance = static_cast<UINT>(-1);
     UINT skinAppearance = unknownAppearance;
     DWORD capturedBackground = CLR_INVALID;
@@ -339,10 +361,11 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
     void discardTrack() {
         decoder.reset();
         activeTrack.reset();
+        metadataAttemptsLeft = 0;
         hasImage = false;
     }
 
-    bool beginAnalysis(IAIMPString* uri) {
+    bool beginAnalysis(IAIMPString* uri, TrackRange range) {
         IAIMPAudioDecoder* rawDecoder = nullptr;
         const HRESULT result = decoders->CreateDecoderForFileURI(uri,
             AIMP_DECODER_FLAGS_FORCE_CREATE_INSTANCE, nullptr, &rawDecoder);
@@ -354,14 +377,23 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
             (!isFloat && format != AIMP_DECODER_SAMPLEFORMAT_16BIT)) return false;
         frameBytes = channels * (isFloat ? 4 : 2);
         const INT64 streamFrames = source->GetSize() / frameBytes;
-        INT64 firstFrame = 0;
+        if (streamFrames <= 0) return false;
+        clipStart = 0;
         frames = streamFrames;
-        if (frames <= 0) return false;
-        double trackDuration = 0;
-        if (SUCCEEDED(player->GetDuration(&trackDuration)) && trackDuration > 0 &&
-            std::abs(static_cast<double>(streamFrames) / rate - trackDuration) > 1 &&
-            !cueRange(uri, trackDuration, rate, streamFrames, firstFrame, frames)) return false;
-        clipStart = firstFrame;
+        if (range.end > 0) {
+            constexpr double toleranceSeconds = 1;
+            const double streamDuration = static_cast<double>(streamFrames) / rate;
+            // Some decoders already return only the selected segment.
+            const bool decoderClipped = range.end > streamDuration &&
+                std::abs(streamDuration - (range.end - range.start)) <= toleranceSeconds;
+            if (!decoderClipped) {
+                if (range.start >= streamDuration || range.end > streamDuration + toleranceSeconds) return false;
+                clipStart = std::llround(range.start * rate);
+                const INT64 endFrame = range.end >= streamDuration ? streamFrames : std::llround(range.end * rate);
+                frames = endFrame - clipStart;
+                if (frames <= 0) return false;
+            }
+        }
         decoder = std::move(source);
         columns = static_cast<int>(std::min<INT64>(width, frames));
         // Aim for a window a quarter as long as the time represented by one column.
@@ -476,7 +508,6 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
 
     void analyzeNextBlock() {
         if (!decoder) return;
-        using Clock = std::chrono::steady_clock;
         const auto deadline = Clock::now() + std::chrono::milliseconds(4);
         do {
             if (!analyzeWindow()) {
@@ -488,27 +519,44 @@ class Visualization final : public IAIMPExtensionEmbeddedVisualization {
         if (columnStep == 0) decoder.reset();
     }
 
-    void updateImage() {
-        IAIMPPlaylistItem* item = nullptr;
-        if (player->GetState() == AIMP_PLAYER_STATE_STOPPED ||
-            FAILED(player->GetPlaylistItem(&item)) || !item) {
+    void updateImage(Clock::time_point now) {
+        IAIMPPlaylistItem* rawItem = nullptr;
+        const HRESULT itemResult = player->GetState() == AIMP_PLAYER_STATE_STOPPED ?
+            S_FALSE : player->GetPlaylistItem(&rawItem);
+        AimpPtr<IAIMPPlaylistItem> item(rawItem);
+        if (FAILED(itemResult) || !item) {
             discardTrack();
             return;
         }
-        if (item == activeTrack.get()) {
-            item->Release();
-            return;
+        if (item.get() != activeTrack.get()) {
+            discardTrack();
+            activeTrack = std::move(item);
+            metadataAttemptsLeft = metadataAttemptLimit;
+            nextMetadataAttempt = now;
         }
-        discardTrack();
-        activeTrack.reset(item);
-        IAIMPString* uri = nullptr;
-        const HRESULT result = item->GetValueAsObject(AIMP_PLAYLISTITEM_PROPID_FILENAME,
-            IID_IAIMPString, reinterpret_cast<void**>(&uri));
+        if (metadataAttemptsLeft == 0 || now < nextMetadataAttempt) return;
+        --metadataAttemptsLeft;
+        nextMetadataAttempt = now + metadataRetryInterval;
+
+        IAIMPString* rawUri = nullptr;
+        const HRESULT result = activeTrack->GetValueAsObject(AIMP_PLAYLISTITEM_PROPID_FILENAME,
+            IID_IAIMPString, reinterpret_cast<void**>(&rawUri));
+        AimpPtr<IAIMPString> uri(rawUri);
         if (FAILED(result) || !uri) return;
+        const int length = uri->GetLength();
+        if (length <= 0) return;
+
         const wchar_t* path = uri->GetData();
-        const bool localFile = path && uri->GetLength() >= 3 && path[1] == L':' && path[2] == L'\\';
-        hasImage = localFile && beginAnalysis(uri);
-        uri->Release();
+        TrackRange range;
+        auto status = TrackRangeStatus::Invalid;
+        if (path && length >= 3 && path[1] == L':' && path[2] == L'\\') {
+            // AIMP appends :<track> to the container path for a virtual file.
+            status = std::wmemchr(path + 3, L':', length - 3) ?
+                readTrackRange(uri.get(), activeTrack.get(), range) : TrackRangeStatus::Ready;
+        }
+        if (status == TrackRangeStatus::AwaitingMetadata) return;
+        metadataAttemptsLeft = 0;
+        if (status == TrackRangeStatus::Ready) hasImage = beginAnalysis(uri.get(), range);
     }
 
 public:
@@ -547,7 +595,7 @@ public:
     void WINAPI Draw(HCANVAS canvas, PAIMPVisualData) override {
         if (width <= 0 || height <= 0 || switchingLayout.load()) return;
         if (samplingTheme) return;
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = Clock::now();
         if (now >= nextThemeRead) {
             nextThemeRead = now + std::chrono::seconds(1);
             if (!skinSettingsPath.empty()) {
@@ -589,7 +637,7 @@ public:
             plotHeight = newPlotHeight;
             discardTrack();
         }
-        updateImage();
+        updateImage(now);
         analyzeNextBlock();
         RECT area = {0, 0, width, height};
         const COLORREF previousBrushColor = SetDCBrushColor(canvas,
@@ -897,10 +945,12 @@ public:
     ULONG WINAPI Release() override { return InterlockedDecrement(&references); }
     PChar WINAPI InfoGet(INT32 field) override {
         static wchar_t name[] = L"Static spectrogram probe";
-        static wchar_t author[] = L"Local test";
+        static wchar_t author[] = L"HellbringerOnline";
+        static wchar_t description[] = L"Better AIMP 0.1.3";
         static wchar_t empty[] = L"";
         if (field == AIMP_PLUGIN_INFO_NAME) return name;
         if (field == AIMP_PLUGIN_INFO_AUTHOR) return author;
+        if (field == AIMP_PLUGIN_INFO_SHORT_DESCRIPTION) return description;
         return empty;
     }
     DWORD WINAPI InfoGetCategories() override { return AIMP_PLUGIN_CATEGORY_VISUALS; }
